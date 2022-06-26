@@ -1,0 +1,716 @@
+---
+title: "PostMates Delivery Analysis"
+author: "Chris Gunderson"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: cosmo
+    highlight: kate
+---
+
+## Project Overview
+
+Between 3/9/2019 and 3/21/2020, I recorded my PostMates delivery data while living in Denver, CO. My goal was to examine basic descriptive statistics (e.g., mean per hour earnings) and visualize my earnings by each day of the week, the most likely to time to pick up orders (when it is busiest), the average distance I would drive from a delivery location to a customer, and how many deliveries I would typically make per hour..
+
+## Load packages
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidytext)
+library(readxl)
+library(lubridate)
+library(hms)
+library(scales)
+library(gmodels) # for confidence intervals
+library(Hmisc)
+library(effsize)
+```
+
+## Load data
+
+I kept track of three different sets of related data. In `PM_Earnings.xlsx`, I notated when and where I delivered from, the type of location (e.g., Fast Food), base pay, tips, mileage, and how long the order took to receive. `PM_GuaranteedEarning.xlsx` kept track of instances when I made enough deliveries in a specific time period to earn a guaranteed amount of money. `PM_HoursMileage.xlsx` documents how long I spent during a driving session and the total miles driven.
+
+```{r message = FALSE}
+Deliveries <- read_xlsx('PM_Earnings.xlsx')
+
+GuaranteedEarnings <- read_xlsx('PM_GuaranteedEarning.xlsx')
+
+HoursMileage <- read_xlsx('PM_HoursMileage.xlsx')
+```
+
+## Adjust data and add new variables
+
+```{r}
+# Deliveries: add time, weekday names
+
+DelivData <- Deliveries %>%
+  mutate(PickUpTime = as_hms(Date_Time),
+         WeekdayName = wday(Weekday, label = T)) %>%
+  as_tibble()
+
+# Guaranteed earnings
+
+GE <- GuaranteedEarnings %>%
+  mutate(WeekdayName = wday(Weekday, label = T)) %>%
+  as_tibble()
+
+# Hours and Mileage
+
+HM <- HoursMileage %>%
+  mutate(
+    WeekdayName = wday(Weekday, label = T),
+    HoursWorked = ((3600 * Hours) + (60 * Minutes) + Seconds) / 3600
+  ) %>%
+  as_tibble()
+```
+
+## Data Wrangling
+
+First, I needed to wrangle and combine the data to generate basic descriptive statistics.
+
+```{r warning=FALSE, message=FALSE}
+# Dataset 1: deliveries and earnings
+
+DelivCompressed <- DelivData %>%
+  select(Date, PMEarnings, NumDelivery, WeekdayName) %>%
+  group_by(Date, WeekdayName) %>%
+  summarise(
+    SumEarnings = sum(PMEarnings, na.rm = T),
+    TotalDeliveries = sum(NumDelivery, na.rm = T)
+  ) %>%
+  select(Date, WeekdayName, TotalDeliveries, SumEarnings) %>%
+  arrange(desc(Date)) %>%
+  as_tibble()
+
+#Dataset 2: hours worked and mileage
+
+HM2 <- HM %>%
+  select(Date, WeekdayName, HoursWorked, TotalMiles)
+
+#Dataset 3: Combine them!
+
+Combined <- left_join(DelivCompressed,
+                      HM2,
+                      by = c("Date" = "Date",
+                             "WeekdayName" = "WeekdayName")) %>%
+  mutate(PerHrEarning = SumEarnings / HoursWorked) %>% 
+  mutate(DeliveriesPerHour = TotalDeliveries/HoursWorked) %>% 
+  as_tibble()
+
+# Tip ratio
+# TipRatio <- Deliveries %>%
+#   select(TipYesNo) %>%
+#   summarize(MyTipRatio = round(mean(TipYesNo)))
+
+# Calculate average number of deliveries per night
+AvgDelivPerSession <- Deliveries %>%
+  group_by(Session) %>%
+  summarise(sum1 = sum(NumDelivery, na.rm = T)) %>%
+  summarise(sum1 = mean(sum1))
+
+# Calulate the number of unique locations
+LocationName <- c(Deliveries$Loc1,
+                  Deliveries$Loc2,
+                  Deliveries$Loc3,
+                  Deliveries$Loc4,
+                  Deliveries$Loc5)
+UniqueLocations <- length(unique(LocationName))
+
+# Weekly summary of earnings
+WeeklySummary <- Combined %>%
+  select(-WeekdayName) %>%
+  group_by(week(Date)) %>%
+  summarise(
+    AllDeliveries = sum(TotalDeliveries),
+    AllHours = sum(HoursWorked),
+    WeeklyEarning = sum(SumEarnings)
+  )
+
+#95% CI for per hr earning
+perhr_CI <- ci(Combined$PerHrEarning)
+
+#95% CI for tip frequency
+TipSuccess <- Deliveries %>%
+  select(TipYesNo) %>%
+  filter(TipYesNo == 1) %>%
+  count()
+
+TipOpportunities <- Deliveries %>%
+  select(TipYesNo) %>%
+  count()
+
+TipCI <- binconf(x = TipSuccess$n,
+                 n = TipOpportunities$n)
+
+# How often to I get the guaranteed earnings?
+Data1 <- Combined %>%
+  mutate(WeekdayName = as.character(WeekdayName)) %>%
+  filter(WeekdayName == "Fri" |
+           WeekdayName == "Sat" |
+           WeekdayName == "Sun") %>%
+  select(Date, WeekdayName, SumEarnings)
+
+Data2 <- GE %>%
+  mutate(WeekdayName = as.character(WeekdayName)) %>%
+  select(Date, WeekdayName, GEEarnings)
+
+Data3 <- right_join(Data2, Data1,
+                    by = 'Date', 'WeekdayName') %>%
+  mutate(GE_Achieved = if_else(GEEarnings > 0, 1, 0),
+         GE_Achieved = replace_na(GE_Achieved, 0)) %>%
+  rename(WeekdayName = WeekdayName.x,
+         PMEarnings = SumEarnings) %>%
+  select(Date, WeekdayName, PMEarnings, GEEarnings, GE_Achieved) %>%
+  mutate(WeekdayName = wday(Date, label = T)) %>% 
+  arrange(Date) %>% 
+  as_tibble() %>% 
+  mutate(GEEarnings = replace_na(GEEarnings, 0),
+         TotalEarnings = PMEarnings + GEEarnings)
+
+Data4 <- left_join(Data3,
+                      HM2,
+                      by = c("Date" = "Date",
+                             "WeekdayName" = "WeekdayName")) %>%
+  mutate(PerHrEarning = TotalEarnings / HoursWorked)
+
+#95% CI for guaranteed earnings frequency
+GE_A <- Data3 %>%
+  select(GE_Achieved) %>%
+  filter(GE_Achieved == 1) %>%
+  count()
+
+GE_Oppor <- Data3 %>%
+  select(GE_Achieved) %>%
+  count()
+
+GE_CI <- binconf(x = GE_A$n,
+                 n = GE_Oppor$n)
+
+#Per session sum earning
+Sesssion_Earning_CI <- ci(Combined$SumEarnings)
+
+#How many hours do I average per session
+HoursWorkedPerSession <- Combined %>% 
+  group_by(week(Date)) %>% 
+  summarise(Sum_hrs = sum(HoursWorked))
+
+```
+
+## Basic income statistics
+
+Next, I wanted a nicely formatted output of descriptive statistics. This gives me a quick overview of the number of sessions, deliveries, locations, earnings, hours worked, and miles driven.
+
+```{r}
+cat(
+  "\nNumber of sessions =",
+  max(DelivData$Session),
+  "\nNumber of deliveries =",
+  sum(DelivData$NumDelivery, na.rm = T),
+  "\nNumber of unique locations =",
+  UniqueLocations,
+  "\n",
+  "\nBase pay earnings =",
+  sum(DelivData$BasePay, na.rm = T),
+  "\nTip earnings =",
+  sum(DelivData$Tip, na.rm = T),
+  "\n",
+  "\nGuaranteed earnings =",
+  sum(GE$GEEarnings, na.rm = T),
+  "\n",
+  "\nTotal earnings =",
+  (
+    sum(DelivData$PMEarnings, na.rm = T) + sum(GE$GEEarnings, na.rm = T)
+  ),
+  "\n",
+  "\nTip frequency =",
+  round(TipCI[1], 2),
+  "\nTip frequency 95% CI lower bound = ",
+  round(TipCI[2], 2),
+  "\nTip frequency 95% CI upper bound = ",
+  round(TipCI[3], 2),
+  "\n",
+  "\nGuaranteed earnings frequency estimate = ",
+  round(mean(GE_CI[1]), 2),
+  "\nGuaranteed earnings 95% CI lower bound = ",
+  round(mean(GE_CI[2]), 2),
+  "\nGuaranteed earnings 95% CI upper bound = ",
+  round(mean(GE_CI[3]), 2),
+  "\n",
+  "\nPer hour earning estimate =",
+  (round(mean(
+    Combined$PerHrEarning
+  ), 2)),
+  "\nPer hour earning 95% CI lower bound = ",
+  round(perhr_CI[2], 2),
+  "\nPer hour earning 95% CI upper bound = ",
+  round(perhr_CI[3], 2),
+  "\n",
+  "\nAverage earning per session = ",
+  round(Sesssion_Earning_CI[1], 2),
+  "\nAverage earning per session 95% CI lower bound = ",
+  round(Sesssion_Earning_CI[2], 2),
+  "\nAverage earning per session 95% CI upper bound = ",
+  round(Sesssion_Earning_CI[3], 2),
+  "\n",
+  "\nAverage weekly earning = ",
+  round(mean(WeeklySummary$WeeklyEarning), 2),
+  "\nAverage weekly number of deliveries = ",
+  round(mean(WeeklySummary$AllDeliveries), 0),
+  "\nAverage weekly number of hours worked = ",
+  round(mean(HoursWorkedPerSession$Sum_hrs), 2),
+  "\n",
+  "\nTotal number of hours worked =",
+  round(sum(HM$HoursWorked), 2),
+  "\nTotal miles driven =",
+  sum(HM$TotalMiles)
+)
+```
+
+## Earnings per month
+
+I group and calculate earnings by month for each month I did PostMates deliveries.
+
+
+```{r message=FALSE}
+# Earnings from deliveries
+
+DeliveryEarnings <- DelivData %>%
+  select(Date, WeekdayName, NumDelivery, PMEarnings) %>%
+  group_by(Date, WeekdayName) %>%
+  summarise(
+    DeliveryEarning = sum(PMEarnings, na.rm = T),
+    TotalDeliveries = sum(NumDelivery, na.rm = T)
+  )
+
+#Earnings from guaranteed earnings
+
+GE_Earnings <- GE %>%
+  select(Date, WeekdayName, GEEarnings)
+
+#joined dataset
+
+Delivery_and_Guaranteed <- left_join(DeliveryEarnings, GE_Earnings,
+                                     by = c("Date", "WeekdayName")) %>%
+  replace(., is.na(.), 0) %>%
+  summarise(
+    TotalEarnings = (DeliveryEarning + GEEarnings),
+    TotalDeliveries = sum(TotalDeliveries)
+  )
+
+#summarize earnings by month
+
+EarningsPerMonth <- Delivery_and_Guaranteed %>%
+  mutate(Month = month(Date, label = T),
+         Year = year(Date)) %>%
+  group_by(Year, Month) %>%
+  summarise(
+    MonthlyEarning = sum(TotalEarnings),
+    TotalDeliveries = sum(TotalDeliveries),
+    Mean_Per_Delivery = (MonthlyEarning/TotalDeliveries)
+  )
+EarningsPerMonth
+```
+
+## Earnings per week 
+
+I also examined how much I made per week, how many hours I worked, and how many deliveries I made.
+
+```{r message=FALSE}
+WeeklySummary <- Combined %>%
+  select(-WeekdayName) %>%
+  mutate(Month = month(Date, label = T),
+         Year = year(Date)) %>% 
+  group_by(Year, week(Date), Month) %>%
+  summarise(
+    Deliveries = sum(TotalDeliveries),
+    HoursWorked = sum(HoursWorked),
+    WeeklyEarning = sum(SumEarnings)
+  ) %>%
+  rename(WeekOfYear = `week(Date)`)
+WeeklySummary %>% print(n = 200)
+```
+
+## How much do I make for a single delivery?
+
+After making many deliveries, I wanted to know how much I made for a single delivery. This excludes 'stacked' deliveries, where I picked up an several orders from one location, or picked up several deliveries from more than one location before making deliveries to customers.
+
+```{r}
+OneDelivery <- Deliveries %>%
+  filter(NumDelivery == 1) %>%
+  summarise(
+    n = n(),
+    Mean_Per_Delivery = round(mean(PMEarnings, na.rm = T), 2),
+    Mean_Base_Pay = round(mean(BasePay, na.rm = T), 2),
+    Mean_Tip = round(mean(Tip, na.rm = T), 2)
+  )
+OneDelivery
+```
+
+## How much do I make on 'stacked' deliveries?
+
+Occasionally, I made 'stacked' deliveries, as described above. Here, I wanted descriptive statistics on how much I made for making stacked deliveries. `NumDelivery` indicates the number of items I picked up (from one or more locations) before making deliveries to customers.
+
+```{r}
+StackedDelivery <- Deliveries %>%
+  filter(NumDelivery > 1) %>%
+  group_by(NumDelivery) %>% 
+  summarise(
+    n = n(),
+    Mean_Per_Delivery = round(mean(PMEarnings, na.rm = T), 2),
+    Mean_Base_Pay = round(mean(BasePay, na.rm = T), 2),
+    Mean_Tip = round(mean(Tip, na.rm = T), 2)
+  )
+StackedDelivery
+```
+
+## Per hour earning by day of the week
+
+It's possible that particular days of the week are more profitable than others. Here, I created a lollipop chart. Specifically, each (jittered) dot indicates the total earning for a particular day of the week (x-axis). 
+
+```{r}
+ggplot(Combined, aes(x= WeekdayName, y= PerHrEarning)) + 
+  geom_jitter(size = 3, 
+              width = .06,
+              alpha = 0.4,
+              aes(color = WeekdayName),
+              show.legend = FALSE) +
+  geom_segment(aes(x = WeekdayName,
+                   xend = WeekdayName,
+                   y = 0,
+                   yend = PerHrEarning,
+                   color = WeekdayName), 
+               show.legend = FALSE) +
+  geom_hline(aes(yintercept = mean(PerHrEarning)),
+             linetype = "dashed",
+             color = "black",
+             alpha = .4) +
+  labs(x = "Day of the Week",
+       y = "Per hour earning") +
+  scale_colour_brewer(palette = "Dark2") +
+  theme_light()
+```
+
+## What are my most frequent delivery locations and their tip ratio?
+
+Since I had a sufficient amount of unique locations that I delivered from, I wanted to find out which locations I deliver from most frequently, and how often I received a tip from doing those deliveries (`TipRatio`). For example, I made 70 deliveries from Shake Shack and received a tip 91% of the time.
+
+```{r}
+LocationName <- c(Deliveries$Loc1,
+                  Deliveries$Loc2,
+                  Deliveries$Loc3,
+                  Deliveries$Loc4,
+                  Deliveries$Loc5)
+
+LocationNumber <- c(Deliveries$Loc1_Num,
+                    Deliveries$Loc2_Num,
+                    Deliveries$Loc3_Num,
+                    Deliveries$Loc4_Num,
+                    Deliveries$Loc5_Num)
+
+LocationTip <- c(Deliveries$TipYesNo,
+                 Deliveries$TipYesNo,
+                 Deliveries$TipYesNo,
+                 Deliveries$TipYesNo,
+                 Deliveries$TipYesNo)
+
+MyLocations <- as_tibble(cbind(LocationName,
+                               LocationNumber))
+
+MyLocationTips <- as_tibble(cbind(LocationName,
+                                  LocationTip))
+
+MyLocations$LocationNumber <- as.numeric(LocationNumber)
+
+MyLocationTips$LocationTip <- as.numeric(LocationTip)
+
+
+MyTopLocations <- MyLocations %>%
+  group_by(LocationName) %>%
+  summarise(Deliveries = sum(LocationNumber, na.rm = T))
+
+TipRatios <- MyLocationTips %>%
+  group_by(LocationName) %>%
+  summarise(TipRatio = round(mean(LocationTip, na.rm = T), 2))
+
+LocsAndRatios <- inner_join(TipRatios, MyTopLocations,
+                            by = "LocationName") %>%
+  select(LocationName, Deliveries, TipRatio) %>%
+  arrange(desc(Deliveries), desc(TipRatio))
+print(LocsAndRatios, n = 12)
+```
+
+## Where have I made the most money?
+
+It may also be advantagous or efficient to know which places resulted in the highest earnings. In this case, Shake Shack was at the top. I also calculated `VisitEarningRatio`, which is the mean earning per visit.
+
+```{r}
+
+LocationName <- c(Deliveries$Loc1,
+                  Deliveries$Loc2,
+                  Deliveries$Loc3,
+                  Deliveries$Loc4,
+                  Deliveries$Loc5)
+
+LocationNumber <- c(Deliveries$Loc1_Num,
+                    Deliveries$Loc2_Num,
+                    Deliveries$Loc3_Num,
+                    Deliveries$Loc4_Num,
+                    Deliveries$Loc5_Num)
+
+LocationEarnings <- c(Deliveries$PMEarnings,
+                      Deliveries$PMEarnings,
+                      Deliveries$PMEarnings,
+                      Deliveries$PMEarnings,
+                      Deliveries$PMEarnings)
+
+MyLocations <- as_tibble(cbind(LocationName,
+                               LocationNumber))
+
+MyLocationEarnings <- as_tibble(cbind(LocationName,
+                                      LocationEarnings))
+
+MyLocationEarnings$LocationNumber <- as.numeric(LocationNumber)
+
+MyLocationEarnings$LocationEarnings <- as.numeric(LocationEarnings)
+
+
+MyTopLocationEarnings <- MyLocationEarnings %>%
+  group_by(LocationName) %>%
+  summarise(
+    Earnings = sum(LocationEarnings, na.rm = T),
+    Visits = n(),
+    VisitEarningRatio = round((Earnings / Visits), 2)
+  ) %>%
+  drop_na() %>%
+  arrange(desc(Earnings),
+          desc(Visits),
+          desc(VisitEarningRatio))
+
+MyTopLocationEarnings
+```
+
+
+## These places don't as tip well (after at least 3 deliveries)
+
+Some places do not tip as well. I first excluded any places I delivered from only once or twice, and then examined the data. After making 10 deliveries from 7-Eleven, my tip ratio was only 40%.
+
+```{r}
+BadTipRatio <- LocsAndRatios %>%
+  filter(Deliveries >= 3) %>%
+  filter(TipRatio <= 0.5) %>%
+  arrange(desc(Deliveries), TipRatio)
+
+print(BadTipRatio, n = 10)
+```
+
+## What places always tip (after at least 5 deliveries)?
+
+Likewise, it would be advantageous to know if there are any locations that tip 100% of the time. I excluded any locations that I made fewer than 5 deliveries from. After delivering from Uncle 28 times, I always got a tip.
+
+```{r}
+AlwaysTip <- LocsAndRatios %>%
+  filter(Deliveries >= 5) %>%
+  filter(TipRatio == 1.0) %>%
+  arrange(desc(Deliveries))
+
+print(AlwaysTip, n = 20)
+```
+
+## Which places most frequently have stacked orders?
+
+To make driving more efficient, I examined the most common locations I received stacked orders from. Again, this occurs when I pick up several deliveries from one more locations before delivering to the customer.
+
+```{r}
+
+StackedOrders <- MyLocations %>%
+  mutate(
+    TripleDeliv = ifelse(LocationNumber == 3,
+                         1, 0),
+    DoubleDeliv = ifelse(LocationNumber == 2,
+                         1, 0),
+    SingleDeliv = ifelse(LocationNumber == 1,
+                         1, 0)
+  ) %>%
+  group_by(LocationName) %>%
+  summarise(
+    Triple = sum(TripleDeliv),
+    Double = sum(DoubleDeliv),
+    StackedTotal = Triple + Double,
+    Single = sum(SingleDeliv)
+  ) %>%
+  mutate(
+    TotalOrders = (Triple * 3) + (Double * 2) + (Single),
+    StackedRatio = round((Triple + Double) /
+                           (Triple + Double + Single), 2)
+  ) %>%
+  arrange(
+    desc(StackedTotal),
+    desc(Triple),
+    desc(Double),
+    desc(Single),
+    desc(TotalOrders),
+    desc(StackedRatio)
+  ) %>%
+  select(LocationName,
+         StackedTotal,
+         Triple,
+         Double,
+         Single,
+         TotalOrders,
+         StackedRatio)
+print(StackedOrders, n = 10)
+```
+
+## What is the most frequent pick up time?
+
+Knowing when to start driving maximizes time spent on deliveries. Here, I plot a histogram, rug plot, and dotted vertical line (represents the mean pick up time) to visualize when I received the most deliveries.
+
+```{r}
+#set lower limit on time, since I've delivered past 12am
+lowerlimit <- as_hms("15:00:00")
+
+#filter data by this lower limit
+DelivData2 <- DelivData %>%
+  filter(PickUpTime >= lowerlimit)
+
+#round the times to the nearest 15 min
+TimeData <- DelivData2 %>%
+  select(Date_Time, PickUpTime) %>%
+  mutate(RoundedPickUps = round_date(Date_Time, unit = "15 mins")) %>%
+  mutate(RoundedPickUpTimes = as_hms(RoundedPickUps))
+
+#plot the data
+ggplot(TimeData, aes(x = PickUpTime)) +
+  geom_density(alpha = 0.5) +
+  geom_rug(aes(x = PickUpTime, y = 0),
+           position = position_jitter(height = 0)) +
+  scale_x_time(labels = time_format("%l:%m")) +
+  geom_vline(aes(xintercept = mean(PickUpTime)),
+             linetype = "dashed",
+             show.legend = FALSE) +
+  labs(x = "Pick up time",
+       y = "Density") +
+  theme_classic()
+```
+
+## How long do I wait before I get a new delivery?
+
+```{r warning=FALSE}
+# BWDeliv <- DelivData %>%
+#   select(Date_Time, Date, Session, WeekdayName, PickUpTime) %>%
+#   arrange((Date_Time)) %>%
+#   group_by(Session, Date) %>%
+#   mutate(myLag = lag(PickUpTime)) %>%
+#   mutate(difference = as.duration(PickUpTime - myLag)) %>%
+#   mutate(difference2 = (difference / 60)) %>%
+#   group_by(Session) %>%
+#   summarise(meanWait = mean(difference2, na.rm = T))
+# 
+# # Plot the mean waiting time between deliveries
+# ggplot(BWDeliv, aes(meanWait)) +
+#   geom_density(alpha = 0.5) +
+#   geom_rug(aes(x = meanWait, y = 0),
+#            position = position_jitter(height = 0)) +
+#   geom_vline(aes(xintercept = mean(meanWait)),
+#              linetype = "dashed",
+#              show.legend = FALSE) +
+#   geom_text(aes(
+#     x = mean(meanWait),
+#     y = .06,
+#     label = round(mean(meanWait))
+#   ),
+#   hjust = -0.3,
+#   size = 3) +
+#   labs(x = "Average wait time between deliveries",
+#        y = "Density")
+```
+
+## Which places have long wait times?
+
+After driving for awhile, it became clear that some places have longer waiting times than others. Knowing which places have long waiting times can help me avoid these locations when I want to maximize the number of deliveries I make per hour.
+
+```{r}
+LocWait <- c(Deliveries$WaitTime_Min,
+             Deliveries$WaitTime_Min,
+             Deliveries$WaitTime_Min,
+             Deliveries$WaitTime_Min,
+             Deliveries$WaitTime_Min)
+
+LocWaits <- as_tibble(cbind(LocationName,
+                            LocWait))
+
+LocWaits$LocWait <- as.numeric(LocWait)
+
+LocationWaitTimes <- LocWaits %>%
+  group_by(LocationName) %>%
+  summarise(MeanWait_Min = round(mean(LocWait, na.rm = T)),
+            Visits = n()) %>%
+  filter(Visits > 2) %>%
+  arrange(desc(MeanWait_Min), desc(Visits))
+print(LocationWaitTimes, n = 10)
+```
+
+## Average distance from restaurant to drop off
+
+This histogram and rug plot (with a dotted vertical line indicating the mean) indicates how far (in miles) the average distance from the delivery pick up to drop off location was.
+
+```{r}
+ggplot(DelivData, aes(Distance_MI)) +
+  geom_density(alpha = 0.5,
+               na.rm = T) +
+  geom_rug(aes(x = Distance_MI, 
+               y = 0),
+           position = position_jitter(height = 0)) +
+  geom_vline(aes(xintercept = mean(Distance_MI, na.rm = T)),
+             linetype = "dashed",
+             show.legend = FALSE) +
+  geom_text(aes(x = mean(Distance_MI, na.rm = T),
+                y = .15,
+                label = round(mean(Distance_MI, na.rm = T),2)),
+            hjust = -0.5, size = 3) +
+  labs(x = "Mean distance (in miles) from restaurant to delivery location",
+       y = "Density") +
+  theme_light()
+```
+
+## Average deliveries per hour
+
+After many deliveries, I wanted to explore how many deliveries I make on average. As indicated in the histogram (and perhaps more clearly with the rug plot), on average I made 2.16 deliveries per hour, but with some variation. As shown above, some locations took longer than others for me to wait for the food. The average deliveries per hour gave me information on what I could expect to earn given a particular time  (e.g., 5:00pm-9:00pm, about 8 deliveries)
+
+```{r}
+ggplot(Combined, aes(DeliveriesPerHour)) +
+  geom_density(alpha = 0.5,
+               na.rm = T) +
+  geom_rug(aes(x = DeliveriesPerHour, 
+               y = 0),
+           position = position_jitter(height = 0)) +
+  geom_vline(aes(xintercept = mean(DeliveriesPerHour, na.rm = T)),
+             linetype = "dashed",
+             show.legend = FALSE) +
+  geom_text(aes(x = mean(DeliveriesPerHour, na.rm = T),
+                y = .15,
+                label = round(mean(DeliveriesPerHour, na.rm = T),2)),
+            hjust = -0.5, size = 3) +
+  labs(x = "Average number of deliveries per hour",
+       y = "Density") +
+  theme_light()
+```
+
+
+## Top 5 best deliveries
+
+Sometimes, I was pleasantly surprised to see I received an excellent tip from a customer. Here, I print my top 5 highest earning deliveries.
+
+```{r}
+Deliveries %>%
+  select(Date, Loc1, Loc2, Loc3, Loc4, Loc5, PMEarnings) %>%
+  mutate(Date = ymd(Date)) %>%
+  arrange(desc(PMEarnings)) %>%
+  print(n = 5)
+```
+
+
+
+
