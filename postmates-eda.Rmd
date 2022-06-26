@@ -9,8 +9,6 @@ knit: (function(input_file, encoding) {
 output: 
   html_document:
     toc: true
-    toc_depth: 2
-    toc_float: true
     theme: cosmo
     highlight: kate
 ---
